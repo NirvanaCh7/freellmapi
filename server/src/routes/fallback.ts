@@ -2,9 +2,48 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
-import { getAllPenalties } from '../services/router.js';
+import { getAllPenalties, getCustomWeights, getRoutingScores, getRoutingStrategy, setCustomWeights, setRoutingStrategy } from '../services/router.js';
+import { BANDIT_PRESETS, type RoutingStrategy } from '../services/scoring.js';
+import { parseBudget } from '../lib/budget.js';
 
 export const fallbackRouter = Router();
+
+// ── Bandit routing strategy ─────────────────────────────────────────────────
+// GET  /routing → active strategy, preset weights, the saved custom weights,
+//                 and the per-model score breakdown (reliability / speed /
+//                 intelligence + guardrails).
+fallbackRouter.get('/routing', (_req: Request, res: Response) => {
+  res.json({ ...getRoutingScores(), customWeights: getCustomWeights() });
+});
+
+const routingSchema = z.object({
+  strategy: z.enum(['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom']),
+  // Only meaningful with strategy 'custom'. Any non-negative vector with a
+  // positive sum is accepted; the server normalizes it to sum to 1.
+  weights: z.object({
+    reliability: z.number().min(0).max(1),
+    speed: z.number().min(0).max(1),
+    intelligence: z.number().min(0).max(1),
+  }).refine(w => w.reliability + w.speed + w.intelligence > 0, {
+    message: 'weights must not all be zero',
+  }).optional(),
+});
+
+// PUT /routing → switch strategy. Presets are just weight vectors over the three
+// axes; 'custom' uses the user-saved vector; 'priority' falls back to the legacy
+// manual chain order.
+fallbackRouter.put('/routing', (req: Request, res: Response) => {
+  const parsed = routingSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    return;
+  }
+  if (parsed.data.strategy === 'custom' && parsed.data.weights) {
+    setCustomWeights(parsed.data.weights);
+  }
+  setRoutingStrategy(parsed.data.strategy as RoutingStrategy);
+  res.json({ strategy: getRoutingStrategy(), presets: BANDIT_PRESETS, customWeights: getCustomWeights() });
+});
 
 // Get fallback chain (with dynamic penalties)
 fallbackRouter.get('/', (_req: Request, res: Response) => {
@@ -13,7 +52,7 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
     SELECT fc.model_db_id, fc.priority, fc.enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
-           m.monthly_token_budget, m.supports_vision
+           m.monthly_token_budget, m.supports_vision, m.supports_tools
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
     ORDER BY fc.priority ASC
@@ -50,6 +89,7 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       rpdLimit: r.rpd_limit,
       monthlyTokenBudget: r.monthly_token_budget,
       supportsVision: r.supports_vision === 1,
+      supportsTools: r.supports_tools === 1,
       keyCount: keyCountMap.get(r.platform) ?? 0,
     };
   }));
@@ -144,14 +184,6 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
     ORDER BY fc.priority ASC
   `).all() as { platform: string; model_id: string; display_name: string; monthly_token_budget: string; priority: number }[];
 
-  function parseBudget(s: string): number {
-    const m = s.match(/~?([\d.]+)(?:-([\d.]+))?([MK])?/);
-    if (!m) return 0;
-    const high = parseFloat(m[2] ?? m[1]);
-    const unit = m[3] === 'M' ? 1_000_000 : m[3] === 'K' ? 1_000 : 1;
-    return high * unit;
-  }
-
   // Build per-model breakdown (only platforms with keys)
   const modelBudgets = models
     .filter(m => platformSet.has(m.platform))
@@ -169,6 +201,7 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
       COALESCE(SUM(input_tokens + output_tokens), 0) as total_used
     FROM requests
     WHERE created_at >= datetime('now', 'start of month')
+      AND request_type = 'chat'
   `).get() as { total_used: number };
 
   res.json({

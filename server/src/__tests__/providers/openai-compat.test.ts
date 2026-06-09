@@ -92,6 +92,45 @@ describe('OpenAICompatProvider', () => {
     expect(capturedBody.parallel_tool_calls).toBe(true);
   });
 
+  describe('forceSingleToolCall (NVIDIA NIM single-tool-call 400 — issue #255)', () => {
+    const nim = () => new OpenAICompatProvider({
+      platform: 'nvidia',
+      name: 'NVIDIA NIM',
+      baseUrl: 'https://integrate.api.nvidia.com/v1',
+      forceSingleToolCall: true,
+    });
+    const okResponse = {
+      ok: true,
+      json: () => Promise.resolve({
+        id: 'x', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    } as any;
+    const tools = [{ type: 'function' as const, function: { name: 'f', description: 'd', parameters: { type: 'object', properties: {} } } }];
+
+    it('pins parallel_tool_calls to false when tools are present, even if the caller asked for true', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
+      await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm', { tools, parallel_tool_calls: true });
+      expect(body.parallel_tool_calls).toBe(false);
+    });
+
+    it('leaves parallel_tool_calls untouched when there are no tools', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
+      await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm', {});
+      expect(body.parallel_tool_calls).toBeUndefined();
+    });
+
+    it('does not affect providers without the flag (parallel_tool_calls passes through)', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
+      await provider.chatCompletion('k', [{ role: 'user', content: 'hi' }], 'm', { tools, parallel_tool_calls: true });
+      expect(body.parallel_tool_calls).toBe(true);
+    });
+  });
+
   it('should throw on error response', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({
       ok: false,
@@ -103,6 +142,21 @@ describe('OpenAICompatProvider', () => {
     await expect(
       provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
     ).rejects.toThrow(/Too many requests/);
+  });
+
+  it('explains a non-JSON 200 body instead of surfacing the raw parse error (#189)', async () => {
+    // e.g. a custom base URL pointing at Ollama's native NDJSON /api endpoint:
+    // real fetch's res.json() rejects with "Unexpected non-whitespace character
+    // after JSON at position …", which is useless to the user.
+    vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: () => Promise.reject(new SyntaxError('Unexpected non-whitespace character after JSON at position 583 (line 27 column 2)')),
+    } as any);
+
+    await expect(
+      provider.chatCompletion('key', [{ role: 'user', content: 'hi' }], 'model')
+    ).rejects.toThrow(/not OpenAI-compatible/);
   });
 
   it('should validate key using models endpoint', async () => {
@@ -241,12 +295,12 @@ describe('OpenAICompatProvider - platform instances', () => {
   const platforms = [
     { platform: 'groq',       name: 'Groq',          baseUrl: 'https://api.groq.com/openai/v1' },
     { platform: 'cerebras',   name: 'Cerebras',      baseUrl: 'https://api.cerebras.ai/v1' },
-    { platform: 'sambanova',  name: 'SambaNova',     baseUrl: 'https://api.sambanova.ai/v1' },
     { platform: 'nvidia',     name: 'NVIDIA NIM',    baseUrl: 'https://integrate.api.nvidia.com/v1' },
     { platform: 'mistral',    name: 'Mistral',       baseUrl: 'https://api.mistral.ai/v1' },
     { platform: 'openrouter', name: 'OpenRouter',    baseUrl: 'https://openrouter.ai/api/v1' },
     { platform: 'github',     name: 'GitHub Models', baseUrl: 'https://models.github.ai/inference' },
     { platform: 'zhipu',      name: 'Zhipu AI',      baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
+    { platform: 'opencode',   name: 'OpenCode Zen',  baseUrl: 'https://opencode.ai/zen/v1' },
   ] as const;
 
   for (const p of platforms) {

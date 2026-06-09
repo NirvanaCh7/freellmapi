@@ -7,7 +7,7 @@ import type {
   ChatToolDefinition,
   TokenUsage,
 } from '@freellmapi/shared/types.js';
-import { BaseProvider, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
 import { contentToString } from '../lib/content.js';
 
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
@@ -82,8 +82,16 @@ const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
   'patternProperties', 'unevaluatedProperties', 'unevaluatedItems',
   'if', 'then', 'else',
   'contentEncoding', 'contentMediaType', 'contentSchema',
-  'dependentRequired', 'dependentSchemas',
+  'dependentRequired', 'dependentSchemas', 'dependencies',
   'additionalProperties',
+  'examples', 'const', 'readOnly', 'writeOnly',
+  'uniqueItems',
+  'not', 'allOf', 'oneOf',
+  'prefixItems',
+  'contains', 'minContains', 'maxContains',
+  'propertyNames',
+  'multipleOf',
+  'deprecated',
 ]);
 
 export function sanitizeForGemini(schema: unknown): unknown {
@@ -342,7 +350,7 @@ export class GoogleProvider extends BaseProvider {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(`Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw providerHttpError(res, `Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
     }
 
     const data = await res.json() as GeminiResponse;
@@ -405,7 +413,7 @@ export class GoogleProvider extends BaseProvider {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(`Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw providerHttpError(res, `Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
     }
 
     const reader = res.body?.getReader();

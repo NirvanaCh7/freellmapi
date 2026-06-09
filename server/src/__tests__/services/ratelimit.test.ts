@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   canMakeRequest,
   canUseTokens,
@@ -8,7 +8,11 @@ import {
   getRateLimitStatus,
   getNextCooldownDuration,
   getCooldownDurationForLimit,
+  canUseProvider,
+  providerDailyRequestCount,
+  getProviderDailyRequestCap,
 } from '../../services/ratelimit.js';
+import { parseRetryAfterMs } from '../../providers/base.js';
 
 function removeDbFile(dbPath: string) {
   for (const suffix of ['', '-shm', '-wal']) {
@@ -185,5 +189,85 @@ describe('Rate Limiter', () => {
         removeDbFile(dbPath);
       }
     });
+  });
+
+  describe('provider-wide daily request cap (#162)', () => {
+    const ENV = 'PROVIDER_DAILY_REQUEST_CAP_OPENROUTER';
+    let original: string | undefined;
+
+    beforeEach(() => { original = process.env[ENV]; });
+    afterEach(() => {
+      if (original === undefined) delete process.env[ENV];
+      else process.env[ENV] = original;
+    });
+
+    it('defaults to OpenRouter ~1000/day and allows env override / disable', () => {
+      delete process.env[ENV];
+      expect(getProviderDailyRequestCap('openrouter')).toBe(1000);
+      expect(getProviderDailyRequestCap('groq')).toBeNull(); // no shared cap
+      process.env[ENV] = '50';
+      expect(getProviderDailyRequestCap('openrouter')).toBe(50);
+      process.env[ENV] = '0'; // 0 disables the cap
+      expect(getProviderDailyRequestCap('openrouter')).toBeNull();
+    });
+
+    it('counts requests across ALL of a provider\'s models for one key', () => {
+      recordRequest('openrouter', 'deepseek/deepseek-v3.1:free', testId);
+      recordRequest('openrouter', 'deepseek/deepseek-v3.1:free', testId);
+      recordRequest('openrouter', 'qwen/qwen3-coder:free', testId);
+      // Same key on a different provider must not bleed into the count.
+      recordRequest('groq', 'llama-70b', testId);
+      expect(providerDailyRequestCount('openrouter', testId)).toBe(3);
+    });
+
+    it('blocks the whole provider once the shared daily cap is hit', () => {
+      process.env[ENV] = '3';
+      recordRequest('openrouter', 'model-a', testId);
+      recordRequest('openrouter', 'model-b', testId);
+      expect(canUseProvider('openrouter', testId)).toBe(true); // 2 < 3
+      recordRequest('openrouter', 'model-c', testId);
+      expect(canUseProvider('openrouter', testId)).toBe(false); // 3 >= 3
+    });
+  });
+});
+
+describe('Cooldown duration with upstream Retry-After', () => {
+  const noLimits = { rpd: null, tpd: null };
+  let testId: number;
+  beforeEach(() => { testId = Math.floor(Math.random() * 1_000_000); });
+
+  it('uses the transient cooldown when no Retry-After is given', () => {
+    expect(getCooldownDurationForLimit('groq', 'm', testId, noLimits)).toBe(90_000);
+  });
+
+  it('never benches shorter than the heuristic (ignores a shorter Retry-After)', () => {
+    expect(getCooldownDurationForLimit('groq', 'm', testId, noLimits, 30_000)).toBe(90_000);
+  });
+
+  it('honors a Retry-After longer than the heuristic', () => {
+    expect(getCooldownDurationForLimit('groq', 'm', testId, noLimits, 300_000)).toBe(300_000);
+  });
+
+  it('caps an absurd Retry-After at a day', () => {
+    expect(getCooldownDurationForLimit('groq', 'm', testId, noLimits, 5 * 86_400_000)).toBe(86_400_000);
+  });
+});
+
+describe('parseRetryAfterMs', () => {
+  it('parses delta-seconds', () => {
+    expect(parseRetryAfterMs('120')).toBe(120_000);
+    expect(parseRetryAfterMs('0')).toBe(0);
+  });
+
+  it('parses an HTTP-date into a positive future delay', () => {
+    const ms = parseRetryAfterMs(new Date(Date.now() + 60_000).toUTCString());
+    expect(ms).toBeGreaterThan(50_000);
+    expect(ms).toBeLessThanOrEqual(60_000);
+  });
+
+  it('returns undefined for absent or unparseable values', () => {
+    expect(parseRetryAfterMs(null)).toBeUndefined();
+    expect(parseRetryAfterMs('')).toBeUndefined();
+    expect(parseRetryAfterMs('soon')).toBeUndefined();
   });
 });

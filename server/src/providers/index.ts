@@ -28,18 +28,19 @@ register(new OpenAICompatProvider({
   baseUrl: 'https://api.cerebras.ai/v1',
 }));
 
-// SambaNova - OpenAI-compatible
-register(new OpenAICompatProvider({
-  platform: 'sambanova',
-  name: 'SambaNova',
-  baseUrl: 'https://api.sambanova.ai/v1',
-}));
+// SambaNova was dropped in V23 (June 2026): the free tier is permanently gone.
+// The always-free tier was retired in early 2025 for a one-time $5 trial
+// credit (expires in 3 months); once it lapses, every chat call 402s
+// "payment method required" with no recurring no-card path back.
 
-// NVIDIA NIM - OpenAI-compatible
+// NVIDIA NIM - OpenAI-compatible. Several NIM models reject parallel tool calls
+// ("This model only supports single tool-calls at once!"), so pin
+// parallel_tool_calls to false when tools are present. See issue #255.
 register(new OpenAICompatProvider({
   platform: 'nvidia',
   name: 'NVIDIA NIM',
   baseUrl: 'https://integrate.api.nvidia.com/v1',
+  forceSingleToolCall: true,
 }));
 
 // Mistral - OpenAI-compatible
@@ -113,14 +114,20 @@ register(new OpenAICompatProvider({
   timeoutMs: 120000,
 }));
 
-// Kilo AI Gateway — OpenAI-compatible aggregator. Anonymous access works
-// (200 req/hr per IP) for the few :free routes still active; a Kilo API key
-// raises the limit. Most named "free" routes in the docs have transitioned to
-// paid ("free period ended") — probe before adding catalog rows.
+// Kilo AI Gateway — OpenAI-compatible aggregator. Kilo documents anonymous
+// (keyless) access for `:free` routes, rate-limited 200 req/hr per IP — so this
+// is registered `keyless: true`: the provider omits the Authorization header and
+// the Keys page stores a sentinel row so routing treats it as configured. Free
+// prompts/outputs are logged for training. validateUrl points at the gateway's
+// real model list (`/api/gateway/models`, no `/v1`) which answers GET keyless;
+// the `/v1/models` path only accepts POST (405). Probe before adding catalog
+// rows — most named "free" routes eventually transition to paid.
 register(new OpenAICompatProvider({
   platform: 'kilo',
   name: 'Kilo Gateway',
   baseUrl: 'https://api.kilo.ai/api/gateway/v1',
+  validateUrl: 'https://api.kilo.ai/api/gateway/models',
+  keyless: true,
 }));
 
 // Pollinations — OpenAI-compatible, anonymous tier. The chat completions
@@ -141,6 +148,18 @@ register(new OpenAICompatProvider({
   platform: 'llm7',
   name: 'LLM7',
   baseUrl: 'https://api.llm7.io/v1',
+}));
+
+// OpenCode Zen — OpenAI-compatible gateway (https://opencode.ai/zen/v1), same
+// adapter as Groq/OpenRouter. A handful of promotional models are free for a
+// limited time; they need a free account key from https://opencode.ai/auth
+// (no card required — billing only applies to paid models). The free roster is
+// trial-only and prompts/outputs may be used to improve the models, so we seed
+// just the docs-confirmed free IDs (migrateModelsV18) with conservative limits.
+register(new OpenAICompatProvider({
+  platform: 'opencode',
+  name: 'OpenCode Zen',
+  baseUrl: 'https://opencode.ai/zen/v1',
 }));
 
 // Chutes was evaluated for V11 and dropped: probe with a free-tier key
