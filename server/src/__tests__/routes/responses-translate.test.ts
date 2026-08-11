@@ -98,6 +98,38 @@ describe('Responses → chat translation (#96)', () => {
     expect(msgs).toEqual([{ role: 'user', content: 'hi' }]);
   });
 
+  it('hoists system/developer messages to the start of the conversation', () => {
+    const msgs = toChatMessages({
+      input: [
+        { type: 'message', role: 'user', content: 'hi' },
+        { type: 'message', role: 'developer', content: 'mid-conversation system' },
+        { type: 'message', role: 'user', content: 'again' },
+      ],
+    } as any);
+    expect(msgs).toEqual([
+      { role: 'system', content: 'mid-conversation system' },
+      { role: 'user', content: 'hi' },
+      { role: 'user', content: 'again' },
+    ]);
+  });
+
+  it('keeps instructions first, then hoisted system messages in order', () => {
+    const msgs = toChatMessages({
+      instructions: 'You are terse.',
+      input: [
+        { type: 'message', role: 'user', content: 'hi' },
+        { type: 'message', role: 'developer', content: 'rule 2' },
+        { type: 'message', role: 'developer', content: 'rule 3' },
+      ],
+    } as any);
+    expect(msgs).toEqual([
+      { role: 'system', content: 'You are terse.' },
+      { role: 'system', content: 'rule 2' },
+      { role: 'system', content: 'rule 3' },
+      { role: 'user', content: 'hi' },
+    ]);
+  });
+
   it('skips computer_call / computer_call_output / reasoning / local_shell_call input items', () => {
     const msgs = toChatMessages({
       input: [

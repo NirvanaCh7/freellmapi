@@ -243,16 +243,18 @@ export function responsesInputRequestsComputerUse(req: ResponsesRequest): boolea
 
 // ── Translate a Responses request → internal chat messages + options ──────
 export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
-  const messages: ChatMessage[] = [];
+  const systemMessages: ChatMessage[] = [];
 
   if (req.instructions) {
-    messages.push({ role: 'system', content: req.instructions });
+    systemMessages.push({ role: 'system', content: req.instructions });
   }
 
   if (typeof req.input === 'string') {
-    messages.push({ role: 'user', content: req.input });
-    return messages;
+    const messages = [{ role: 'user' as const, content: req.input }];
+    return [...systemMessages, ...messages];
   }
+
+  const messages: ChatMessage[] = [];
 
   const items = req.input;
   for (let i = 0; i < items.length; i++) {
@@ -294,6 +296,15 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
     const role = m.role === 'developer' ? 'system' : m.role;
     const content = partsToString(m.content);
 
+    if (role === 'system') {
+      // Hoist system/developer messages to the start of the conversation:
+      // chat providers (Gemini, Claude, Mistral) reject a system message that
+      // appears after a user turn. Codex history replay often emits developer
+      // items mid-conversation.
+      systemMessages.push({ role: 'system', content });
+      continue;
+    }
+
     if (role === 'assistant') {
       // A Responses assistant turn is a message item followed by its
       // function_call items. Merge them into a single chat assistant message
@@ -329,7 +340,7 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
     messages.push({ role, content });
   }
 
-  return messages;
+  return [...systemMessages, ...messages];
 }
 
 export function toChatTools(tools?: ResponsesRequest['tools']): ChatToolDefinition[] | undefined {
