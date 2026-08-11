@@ -201,6 +201,41 @@ describe('POST /v1/responses (#96)', () => {
     expect(textDelta).toContain('"delta":"done"');
   });
 
+  it('rejects computer-use requests with a clear 422 before translation', async () => {
+    mockRouteRequest.mockClear();
+    const { status, text } = await post(app, '/v1/responses', {
+      input: 'control the computer',
+      tools: [{ type: 'computer_use_preview', name: 'computer' }],
+    }, key);
+    expect(status).toBe(422);
+    const body = JSON.parse(text);
+    expect(body.error.code).toBe('no_computer_use_model');
+    expect(body.error.type).toBe('invalid_request_error');
+    expect(mockRouteRequest).not.toHaveBeenCalled();
+  });
+
+  it('accepts computer_call_output round-trip items without 400 (validation leniency)', async () => {
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() {
+        return {
+          id: 'c', object: 'chat.completion', created: 0, model: 'fake-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        };
+      },
+      async *streamChatCompletion() { /* unused */ },
+    }));
+
+    const { status, text } = await post(app, '/v1/responses', {
+      input: [
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'planning' }] },
+        { type: 'message', role: 'user', content: 'what is the weather?' },
+      ],
+    }, key);
+    expect(status).toBe(200);
+    expect(JSON.parse(text).output_text).toBe('ok');
+  });
+
   it('routes built-in Responses tools through tool-capable models', async () => {
     mockRouteRequest.mockClear();
     mockRouteRequest.mockReturnValue(fakeRoute({

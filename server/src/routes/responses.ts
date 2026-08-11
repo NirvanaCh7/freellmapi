@@ -103,9 +103,52 @@ const functionCallOutputItemSchema = z.object({
   output: z.union([z.string(), z.array(contentPartSchema), z.record(z.string(), z.unknown())]),
 });
 
+// Remaining official ResponseInputItemParam kinds. Codex computer-use round-trips
+// `computer_call` (the model's action request) and `computer_call_output` (the
+// harness's result, incl. screenshots); multi-turn sessions also replay
+// `reasoning` / `local_shell_call` items. We accept them all so validation never
+// 400s on a standard payload; each is then either mapped (below) or dropped
+// because chat-completions upstreams have no equivalent (computer/local_shell).
+// Each schema is permissive — we only consume the fields that matter.
+const computerCallItemSchema = z.object({
+  type: z.literal('computer_call'),
+  call_id: z.string(),
+  action: z.record(z.string(), z.unknown()).optional(),
+  id: z.string().optional(),
+}).passthrough();
+
+const computerCallOutputItemSchema = z.object({
+  type: z.literal('computer_call_output'),
+  call_id: z.string(),
+  output: z.union([
+    z.string(),
+    z.array(contentPartSchema),
+    z.record(z.string(), z.unknown()),
+  ]).optional(),
+  id: z.string().optional(),
+}).passthrough();
+
+const reasoningItemSchema = z.object({
+  type: z.literal('reasoning'),
+  summary: z.union([z.string(), z.array(contentPartSchema)]).optional(),
+  content: z.union([z.string(), z.array(contentPartSchema)]).optional(),
+  id: z.string().optional(),
+}).passthrough();
+
+const localShellCallItemSchema = z.object({
+  type: z.literal('local_shell_call'),
+  call_id: z.string().optional(),
+  action: z.record(z.string(), z.unknown()).optional(),
+  id: z.string().optional(),
+}).passthrough();
+
 const inputItemSchema = z.union([
   functionCallItemSchema,
   functionCallOutputItemSchema,
+  computerCallItemSchema,
+  computerCallOutputItemSchema,
+  reasoningItemSchema,
+  localShellCallItemSchema,
   messageItemSchema,
 ]);
 
@@ -170,13 +213,32 @@ export function responsesInputHasImage(req: ResponsesRequest): boolean {
   if (typeof req.input === 'string') return false;
   for (const item of req.input) {
     const content = (item as { content?: unknown }).content;
-    if (!Array.isArray(content)) continue;
-    if (content.some((p) => {
+    if (Array.isArray(content) && content.some((p) => {
       const type = (p as { type?: string })?.type;
       return type === 'input_image' || type === 'image_url' || type === 'image';
     })) return true;
+    // computer_call_output carries screenshots under `output`, not `content`.
+    const output = (item as { output?: unknown }).output;
+    if (Array.isArray(output) && output.some((p) => {
+      const type = (p as { type?: string })?.type;
+      return type === 'input_image' || type === 'computer_screenshot' || type === 'image_url';
+    })) return true;
   }
   return false;
+}
+
+// Computer use (the Responses `computer` / `computer_use_preview` tool + its
+// computer_call/computer_call_output items) has no chat-completions equivalent:
+// the harness loop needs the model's computer_actions and screenshot context,
+// neither of which survives translation. Fail clearly (mirroring the image 422)
+// rather than silently dropping the calls and breaking the tool loop.
+export function responsesInputRequestsComputerUse(req: ResponsesRequest): boolean {
+  if ((req.tools ?? []).some((t) => t.type === 'computer' || t.type === 'computer_use_preview')) return true;
+  if (typeof req.input === 'string' || req.input == null) return false;
+  return req.input.some((item) => {
+    const type = (item as { type?: string })?.type;
+    return type === 'computer_call' || type === 'computer_call_output';
+  });
 }
 
 // ── Translate a Responses request → internal chat messages + options ──────
@@ -210,6 +272,11 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
           ? partsToString(item.output as any)
           : JSON.stringify(item.output);
       messages.push({ role: 'tool', tool_call_id: item.call_id, content: output });
+    } else if ('type' in item && item.type !== 'message') {
+      // computer_call / computer_call_output / reasoning / local_shell_call:
+      // no chat-message equivalent (the route 422s computer use up front).
+      // Skip rather than mis-parse as a message item.
+      continue;
     } else {
       // message item
       const m = item as z.infer<typeof messageItemSchema>;
@@ -344,6 +411,20 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         message: 'Image input is not yet supported on /v1/responses. Use /v1/chat/completions with an image_url content part instead.',
         type: 'invalid_request_error',
         code: 'no_vision_model',
+      },
+    });
+    return;
+  }
+
+  // Computer use can't survive the chat-completions translation either (no
+  // computer tool, no screenshot context). Fail clearly instead of silently
+  // dropping the calls and breaking Codex's computer-use tool loop.
+  if (responsesInputRequestsComputerUse(reqData)) {
+    res.status(422).json({
+      error: {
+        message: 'Computer use is not yet supported on /v1/responses (the computer / computer_use_preview tool and computer_call items have no chat-completions equivalent).',
+        type: 'invalid_request_error',
+        code: 'no_computer_use_model',
       },
     });
     return;

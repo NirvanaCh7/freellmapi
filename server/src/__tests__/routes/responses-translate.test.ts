@@ -4,6 +4,8 @@ import {
   toChatTools,
   toChatToolChoice,
   buildResponseObject,
+  responsesInputHasImage,
+  responsesInputRequestsComputerUse,
 } from '../../routes/responses.js';
 
 describe('Responses → chat translation (#96)', () => {
@@ -48,6 +50,35 @@ describe('Responses → chat translation (#96)', () => {
       input: [{ type: 'function_call_output', call_id: 'call_1', output: 'sunny' }],
     } as any);
     expect(msgs[0]).toEqual({ role: 'tool', tool_call_id: 'call_1', content: 'sunny' });
+  });
+
+  it('skips computer_call / computer_call_output / reasoning / local_shell_call input items', () => {
+    const msgs = toChatMessages({
+      input: [
+        { type: 'computer_call', call_id: 'cc_1', action: { type: 'click', coordinate: [1, 2] } },
+        { type: 'computer_call_output', call_id: 'cc_1', output: [{ type: 'computer_screenshot', image_url: 'data:image/png;base64,AA==' }] },
+        { type: 'reasoning', summary: [{ type: 'summary_text', text: 'thinking' }] },
+        { type: 'local_shell_call', call_id: 'ls_1', action: { type: 'bash', command: 'ls' } },
+        { type: 'message', role: 'user', content: 'what now?' },
+      ],
+    } as any);
+    expect(msgs).toEqual([{ role: 'user', content: 'what now?' }]);
+  });
+
+  it('detects computer-use requests from tools and computer_call items', () => {
+    expect(responsesInputRequestsComputerUse({ tools: [{ type: 'computer' }] } as any)).toBe(true);
+    expect(responsesInputRequestsComputerUse({ tools: [{ type: 'computer_use_preview' }] } as any)).toBe(true);
+    expect(responsesInputRequestsComputerUse({ tools: [{ type: 'function', name: 'f' }] } as any)).toBe(false);
+    expect(responsesInputRequestsComputerUse({
+      input: [{ type: 'computer_call', call_id: 'cc_1', action: { type: 'click' } }],
+    } as any)).toBe(true);
+    expect(responsesInputRequestsComputerUse({ input: 'plain text' } as any)).toBe(false);
+  });
+
+  it('detects screenshots inside computer_call_output.output as image input', () => {
+    expect(responsesInputHasImage({
+      input: [{ type: 'computer_call_output', call_id: 'cc_1', output: [{ type: 'computer_screenshot', image_url: 'data:image/png;base64,AA==' }] }],
+    } as any)).toBe(true);
   });
 
   it('converts flat Responses tools to nested chat tools', () => {
