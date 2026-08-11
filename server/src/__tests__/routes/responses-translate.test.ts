@@ -4,7 +4,6 @@ import {
   toChatTools,
   toChatToolChoice,
   buildResponseObject,
-  responsesInputHasImage,
   responsesInputRequestsComputerUse,
 } from '../../routes/responses.js';
 
@@ -32,6 +31,40 @@ describe('Responses → chat translation (#96)', () => {
       { role: 'system', content: 'sys' },
       { role: 'user', content: 'ab' },
     ]);
+  });
+
+  it('translates image parts into image_url content blocks (keeps all-text content a string)', () => {
+    const msgs = toChatMessages({
+      input: [
+        { type: 'message', role: 'user', content: [
+          { type: 'input_text', text: 'what is this?' },
+          { type: 'input_image', image_url: 'data:image/png;base64,AA==' },
+        ] },
+        { type: 'message', role: 'user', content: 'plain text stays a string' },
+      ],
+    } as any);
+    expect(msgs[0]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'what is this?' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+      ],
+    });
+    expect(msgs[1]).toEqual({ role: 'user', content: 'plain text stays a string' });
+  });
+
+  it('accepts chat-style image_url and computer_screenshot parts', () => {
+    const msgs = toChatMessages({
+      input: [
+        { type: 'message', role: 'user', content: [
+          { type: 'image_url', image_url: { url: 'https://example.com/x.png' } },
+        ] },
+      ],
+    } as any);
+    expect(msgs[0]).toEqual({
+      role: 'user',
+      content: [{ type: 'image_url', image_url: { url: 'https://example.com/x.png' } }],
+    });
   });
 
   it('maps a function_call item to an assistant tool_call', () => {
@@ -151,12 +184,6 @@ describe('Responses → chat translation (#96)', () => {
       input: [{ type: 'computer_call', call_id: 'cc_1', action: { type: 'click' } }],
     } as any)).toBe(true);
     expect(responsesInputRequestsComputerUse({ input: 'plain text' } as any)).toBe(false);
-  });
-
-  it('detects screenshots inside computer_call_output.output as image input', () => {
-    expect(responsesInputHasImage({
-      input: [{ type: 'computer_call_output', call_id: 'cc_1', output: [{ type: 'computer_screenshot', image_url: 'data:image/png;base64,AA==' }] }],
-    } as any)).toBe(true);
   });
 
   it('converts flat Responses tools to nested chat tools', () => {

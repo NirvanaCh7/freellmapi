@@ -9,11 +9,11 @@ import type {
   ChatToolChoice,
   Platform,
 } from '@freellmapi/shared/types.js';
-import { routeRequest, hasEnabledToolsModel, resolveStickyPreference, routingReserveTokens, resolveModelGroupCandidates, type RouteResult, type ChainRow } from '../services/router.js';
+import { routeRequest, hasEnabledVisionModel, hasEnabledToolsModel, resolveStickyPreference, routingReserveTokens, resolveModelGroupCandidates, type RouteResult, type ChainRow } from '../services/router.js';
 import { getDb } from '../db/index.js';
 import { resolveAuth, prependSystemPrompt } from '../lib/system-prompt.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
-import { contentToString } from '../lib/content.js';
+import { contentToString, messageHasImage } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { invalidToolArgumentsError, invalidToolCallReasons, isToolArgumentValidationEnabled } from '../lib/tool-validate.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -204,27 +204,37 @@ function partsToString(content: string | Array<{ type: string; text?: unknown }>
     .join('');
 }
 
-// Image input via the Responses API isn't carried through translation yet
-// (partsToString flattens to text). Detect it so we can hard-fail with a clear
-// pointer to /v1/chat/completions rather than silently dropping the image
-// (#118, #125). Recognizes the Responses `input_image` part plus the
-// chat-style `image_url` / `image` parts some clients reuse here.
-export function responsesInputHasImage(req: ResponsesRequest): boolean {
-  if (typeof req.input === 'string') return false;
-  for (const item of req.input) {
-    const content = (item as { content?: unknown }).content;
-    if (Array.isArray(content) && content.some((p) => {
-      const type = (p as { type?: string })?.type;
-      return type === 'input_image' || type === 'image_url' || type === 'image';
-    })) return true;
-    // computer_call_output carries screenshots under `output`, not `content`.
-    const output = (item as { output?: unknown }).output;
-    if (Array.isArray(output) && output.some((p) => {
-      const type = (p as { type?: string })?.type;
-      return type === 'input_image' || type === 'computer_screenshot' || type === 'image_url';
-    })) return true;
+// Responses content parts → internal chat content. Text parts map to text
+// blocks, image parts (Responses `input_image`, chat-style `image_url`/`image`,
+// and computer-use `computer_screenshot`) map to `image_url` blocks so vision
+// routing and the provider adapters see them (parity with /chat/completions).
+// All-text content collapses back to a plain string (the shape upstream chat
+// providers and compression expect); an array comes back only once a message
+// actually carries an image.
+function partsToChatContent(content: string | Array<{ type: string; [k: string]: unknown }>): string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> {
+  if (typeof content === 'string') return content;
+  const blocks: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> = [];
+  for (const p of content) {
+    const type = p.type;
+    const text = p.text;
+    if (type === 'text' || type === 'input_text' || type === 'output_text' || type === 'summary_text' || (type === undefined && typeof text === 'string')) {
+      if (typeof text === 'string') blocks.push({ type: 'text', text });
+      continue;
+    }
+    if (type === 'input_image' || type === 'computer_screenshot' || type === 'image_url' || type === 'image') {
+      // The image lives under `image_url`, as a bare data URL string
+      // (Responses `input_image` / `computer_screenshot`) or as
+      // `{ url }` (chat-style `image_url`).
+      const raw = (p as { image_url?: unknown }).image_url;
+      const url = typeof raw === 'string' ? raw : (raw as { url?: unknown } | undefined)?.url;
+      if (typeof url === 'string') blocks.push({ type: 'image_url', image_url: { url } });
+      continue;
+    }
   }
-  return false;
+  if (blocks.every((b) => b.type === 'text')) {
+    return blocks.map((b) => (b as { type: 'text'; text: string }).text).join('');
+  }
+  return blocks;
 }
 
 // Computer use (the Responses `computer` / `computer_use_preview` tool + its
@@ -294,7 +304,7 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
     const m = item as z.infer<typeof messageItemSchema>;
     // 'developer' is the Responses-era system role.
     const role = m.role === 'developer' ? 'system' : m.role;
-    const content = partsToString(m.content);
+    const content = partsToChatContent(m.content);
 
     if (role === 'system') {
       // Hoist system/developer messages to the start of the conversation:
@@ -457,19 +467,6 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
   const reqData = parsed.data;
 
-  // Vision isn't carried through the Responses translation yet — fail clearly
-  // instead of answering blind to a dropped image (#118, #125).
-  if (responsesInputHasImage(reqData)) {
-    res.status(422).json({
-      error: {
-        message: 'Image input is not yet supported on /v1/responses. Use /v1/chat/completions with an image_url content part instead.',
-        type: 'invalid_request_error',
-        code: 'no_vision_model',
-      },
-    });
-    return;
-  }
-
   // Computer use can't survive the chat-completions translation either (no
   // computer tool, no screenshot context). Fail clearly instead of silently
   // dropping the calls and breaking Codex's computer-use tool loop.
@@ -534,14 +531,35 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     (sum, m) => sum + Math.ceil(contentToString(m.content).length / 4),
     0,
   );
+
+  // Image requests must route to a vision-capable model (mirrors
+  // /chat/completions, proxy.ts). Reject up front with a clear message when
+  // none is enabled; when vision models are available, requireVision routing
+  // skips text-only models — including a pinned/sticky one — and falls back to
+  // a vision-capable peer (#118, #125). A rough per-image token cost keeps
+  // budget routing from being skewed by content the text heuristic can't see.
+  const hasImage = messageHasImage(messages);
+  if (hasImage && !hasEnabledVisionModel()) {
+    res.status(422).json({
+      error: {
+        message: 'This request includes an image, but no vision-capable model is enabled. Enable a vision model (e.g. Gemini 2.5 Flash, Llama 4 Scout) in the Fallback Chain.',
+        type: 'invalid_request_error',
+        code: 'no_vision_model',
+      },
+    });
+    return;
+  }
+  const IMAGE_TOKEN_ESTIMATE = 1000;
+  const imageCount = messages.reduce((n, m) =>
+    n + (Array.isArray(m.content) ? m.content.filter(b => (b as { type?: string })?.type === 'image_url' || (b as { type?: string })?.type === 'image').length : 0), 0);
   // Capped output reserve so a large max_output_tokens can't falsely exclude the
   // model pool (#470); input counts in full.
-  const estimatedTotal = estimatedInputTokens + routingReserveTokens(reqData.max_output_tokens);
+  const estimatedTotal = estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE + routingReserveTokens(reqData.max_output_tokens);
 
   // Guardrail: per-request token budget (request_max_tokens_budget, default
   // off). A request with no max_output_tokens gets its output capped to the
   // budget remainder instead of a rejection.
-  const budgetCheck = applyTokenBudget(estimatedInputTokens, completionOpts.max_tokens);
+  const budgetCheck = applyTokenBudget(estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE, completionOpts.max_tokens);
   if (budgetCheck.rejection) {
     res.status(413).json({
       error: { message: tokenBudgetMessage(budgetCheck.rejection), type: 'invalid_request_error', code: 'request_token_budget' },
@@ -658,7 +676,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     state,
     attemptLog,
     clientGone: () => clientGone,
-    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, false, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain, completionOpts.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined),
+    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain, completionOpts.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined),
     dispatch: async (route, attempt) => {
       traceRouteEvent('Responses', {
         event: attempt === 0 ? 'start' : 'next',

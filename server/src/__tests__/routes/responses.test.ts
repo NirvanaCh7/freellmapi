@@ -50,9 +50,23 @@ describe('POST /v1/responses (#96)', () => {
     expect((await post(app, '/v1/responses', { model: 'auto' }, key)).status).toBe(400);
   });
 
-  // #118: image input isn't carried through the Responses translation yet, so
-  // it must hard-fail clearly rather than silently answer blind to the image.
-  it('rejects image input with a clear 422 pointing at /v1/chat/completions', async () => {
+  // #118: image parts now translate to image_url content blocks, so an image
+  // request must be routed with requireVision=true (only vision-capable models
+  // are candidates; a text-only pinned model is skipped, falling back to a
+  // vision-capable peer). The old unconditional 422 is gone.
+  it('routes an image request through requireVision (vision-capable model)', async () => {
+    mockRouteRequest.mockClear();
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() {
+        return {
+          id: 'c', object: 'chat.completion', created: 0, model: 'fake-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'a red circle' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        };
+      },
+      async *streamChatCompletion() { /* unused */ },
+    }));
+
     const { status, text } = await post(app, '/v1/responses', {
       input: [{
         role: 'user',
@@ -62,8 +76,28 @@ describe('POST /v1/responses (#96)', () => {
         ],
       }],
     }, key);
-    expect(status).toBe(422);
-    expect(JSON.parse(text).error.code).toBe('no_vision_model');
+    expect(status).toBe(200);
+    expect(JSON.parse(text).output_text).toBe('a red circle');
+    // routeRequest arg [3] is requireVision.
+    expect(mockRouteRequest.mock.calls.at(-1)?.[3]).toBe(true);
+  });
+
+  it('rejects an image request with 422 no_vision_model when no vision model is enabled', async () => {
+    mockRouteRequest.mockClear();
+    getDb().prepare('UPDATE models SET enabled = 0 WHERE supports_vision = 1').run();
+    try {
+      const { status, text } = await post(app, '/v1/responses', {
+        input: [{
+          role: 'user',
+          content: [{ type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' }],
+        }],
+      }, key);
+      expect(status).toBe(422);
+      expect(JSON.parse(text).error.code).toBe('no_vision_model');
+      expect(mockRouteRequest).not.toHaveBeenCalled();
+    } finally {
+      getDb().prepare('UPDATE models SET enabled = 1 WHERE supports_vision = 1').run();
+    }
   });
 
   // #103: the x-api-key header (Anthropic wire format) must authenticate here
