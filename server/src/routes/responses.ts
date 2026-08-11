@@ -254,7 +254,10 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
     return messages;
   }
 
-  for (const item of req.input) {
+  const items = req.input;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+
     if ('type' in item && item.type === 'function_call') {
       messages.push({
         role: 'assistant',
@@ -265,25 +268,65 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
           function: { name: item.name, arguments: item.arguments },
         }],
       });
-    } else if ('type' in item && item.type === 'function_call_output') {
+      continue;
+    }
+
+    if ('type' in item && item.type === 'function_call_output') {
       const output = typeof item.output === 'string'
         ? item.output
         : Array.isArray(item.output)
           ? partsToString(item.output as any)
           : JSON.stringify(item.output);
       messages.push({ role: 'tool', tool_call_id: item.call_id, content: output });
-    } else if ('type' in item && item.type !== 'message') {
+      continue;
+    }
+
+    if ('type' in item && item.type !== 'message') {
       // computer_call / computer_call_output / reasoning / local_shell_call:
       // no chat-message equivalent (the route 422s computer use up front).
       // Skip rather than mis-parse as a message item.
       continue;
-    } else {
-      // message item
-      const m = item as z.infer<typeof messageItemSchema>;
-      // 'developer' is the Responses-era system role.
-      const role = m.role === 'developer' ? 'system' : m.role;
-      messages.push({ role, content: partsToString(m.content) });
     }
+
+    // message item
+    const m = item as z.infer<typeof messageItemSchema>;
+    // 'developer' is the Responses-era system role.
+    const role = m.role === 'developer' ? 'system' : m.role;
+    const content = partsToString(m.content);
+
+    if (role === 'assistant') {
+      // A Responses assistant turn is a message item followed by its
+      // function_call items. Merge them into a single chat assistant message
+      // (content + tool_calls); emitting consecutive assistant turns makes
+      // Gemini map them to consecutive model turns and strict upstreams
+      // (Mistral/Cohere) 400. Drop empty assistant items — an empty turn means
+      // nothing to a chat provider. (#96)
+      const toolCalls: ChatToolCall[] = [];
+      let j = i + 1;
+      while (j < items.length && (items[j] as { type?: string }).type === 'function_call') {
+        const fc = items[j] as z.infer<typeof functionCallItemSchema>;
+        toolCalls.push({
+          id: fc.call_id,
+          type: 'function',
+          function: { name: fc.name, arguments: fc.arguments },
+        });
+        j++;
+      }
+      if (toolCalls.length > 0) {
+        messages.push({
+          role: 'assistant',
+          content: content.length > 0 ? content : null,
+          tool_calls: toolCalls,
+        });
+        i = j - 1;
+        continue;
+      }
+      if (content.length === 0) continue;
+      messages.push({ role: 'assistant', content });
+      continue;
+    }
+
+    messages.push({ role, content });
   }
 
   return messages;

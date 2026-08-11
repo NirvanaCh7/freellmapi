@@ -52,6 +52,52 @@ describe('Responses → chat translation (#96)', () => {
     expect(msgs[0]).toEqual({ role: 'tool', tool_call_id: 'call_1', content: 'sunny' });
   });
 
+  it('merges an assistant message item with its following function_call items into one turn', () => {
+    const msgs = toChatMessages({
+      input: [
+        { type: 'message', role: 'assistant', content: 'Let me check.' },
+        { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"SF"}' },
+        { type: 'function_call', call_id: 'call_2', name: 'get_time', arguments: '{}' },
+      ],
+    } as any);
+    expect(msgs).toEqual([
+      {
+        role: 'assistant',
+        content: 'Let me check.',
+        tool_calls: [
+          { id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"SF"}' } },
+          { id: 'call_2', type: 'function', function: { name: 'get_time', arguments: '{}' } },
+        ],
+      },
+    ]);
+  });
+
+  it('merges an empty assistant item with its following function_call items (content null)', () => {
+    const msgs = toChatMessages({
+      input: [
+        { type: 'message', role: 'assistant', content: [] },
+        { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{}' },
+      ],
+    } as any);
+    expect(msgs).toEqual([
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{}' } }],
+      },
+    ]);
+  });
+
+  it('drops empty assistant message items (no tool_calls)', () => {
+    const msgs = toChatMessages({
+      input: [
+        { type: 'message', role: 'assistant', content: [] },
+        { type: 'message', role: 'user', content: 'hi' },
+      ],
+    } as any);
+    expect(msgs).toEqual([{ role: 'user', content: 'hi' }]);
+  });
+
   it('skips computer_call / computer_call_output / reasoning / local_shell_call input items', () => {
     const msgs = toChatMessages({
       input: [
