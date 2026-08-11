@@ -171,6 +171,36 @@ describe('POST /v1/responses (#96)', () => {
     expect(text).toContain('"arguments":"{\\"city\\":\\"SF\\"}"');
   });
 
+  // The Responses streaming SDK indexes snapshot.output by output_index and
+  // crashes on a collision (an output_text delta with the same index as a
+  // function_call item). Models that stream tool_calls BEFORE any closing text
+  // (GLM/Qwen on this surface) used to leave the text item stuck at index 0
+  // while the function_call owned 0 too. Every output item must claim a dense,
+  // unique index.
+  it('stream: keeps output_index unique when tool_calls precede the text item', async () => {
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() { throw new Error('nope'); },
+      async *streamChatCompletion() {
+        yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'fake-model', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{"ci' } }] }, finish_reason: null }] };
+        yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'fake-model', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, type: 'function', function: { arguments: 'ty":"SF"}' } }] }, finish_reason: null }] };
+        yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'fake-model', choices: [{ index: 0, delta: { content: 'done' }, finish_reason: null }] };
+        yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'fake-model', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+      },
+    }));
+
+    const { text } = await post(app, '/v1/responses', { input: 'do it', stream: true }, key);
+    const indices: number[] = [...text.matchAll(/"output_index":(\d+)/g)].map((m) => Number(m[1]));
+    expect(indices.length).toBeGreaterThan(0);
+    // tool_calls + text = two distinct items, so both 0 AND 1 must appear and
+    // the function_call item must not share the text item's index.
+    expect(new Set(indices)).toContain(0);
+    expect(new Set(indices)).toContain(1);
+    // the closing text delta must reference the text item (index 1), not 0
+    const textDelta = text.split('event: response.output_text.delta')[1];
+    expect(textDelta).toContain('"output_index":1');
+    expect(textDelta).toContain('"delta":"done"');
+  });
+
   it('routes built-in Responses tools through tool-capable models', async () => {
     mockRouteRequest.mockClear();
     mockRouteRequest.mockReturnValue(fakeRoute({
