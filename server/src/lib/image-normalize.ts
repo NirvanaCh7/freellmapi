@@ -1,4 +1,3 @@
-import sharp from 'sharp';
 import type { ChatMessage } from '@freellmapi/shared/types.js';
 
 // Inbound image normalization. Vision payloads ride inline as base64 data
@@ -37,6 +36,31 @@ import type { ChatMessage } from '@freellmapi/shared/types.js';
 const DEFAULT_MAX_DIMENSION = 2048;
 const DEFAULT_THRESHOLD_KB = 1024;
 const DEFAULT_QUALITY = 90;
+
+// sharp is a NATIVE module: it ships a prebuilt libvips per platform+arch, and
+// a static `import sharp from 'sharp'` makes a missing or mismatched binary an
+// import-time crash — the whole gateway would fail to boot over an optional
+// image optimization. The desktop build only runs electron-rebuild for
+// better-sqlite3, and slim/musl containers routinely lack the matching
+// prebuild, so load it on first use instead and degrade to pass-through when
+// it isn't there: images ride through at original size, exactly as they did
+// before this module existed.
+type Sharp = typeof import('sharp').default;
+let sharpModule: Sharp | null | undefined;   // undefined = not yet attempted
+
+async function loadSharp(): Promise<Sharp | null> {
+  if (sharpModule !== undefined) return sharpModule;
+  try {
+    sharpModule = (await import('sharp')).default;
+  } catch (err: any) {
+    sharpModule = null;
+    console.warn(
+      '[ImageNormalize] sharp is unavailable, inbound images will not be resized ' +
+      `(set IMAGE_NORMALIZE=off to silence this): ${err?.message ?? err}`,
+    );
+  }
+  return sharpModule;
+}
 
 export interface ImageNormalizeOptions {
   enabled?: boolean;
@@ -108,7 +132,7 @@ function imageSlots(message: ChatMessage): ImageSlot[] {
 
 // Transcode one data URL; returns null when the image should ride along
 // unchanged (under threshold, already compact, http URL, or any failure).
-async function normalizeDataUrl(url: string, opts: ResolvedOptions): Promise<{ url: string; before: number; after: number } | null> {
+async function normalizeDataUrl(sharp: Sharp, url: string, opts: ResolvedOptions): Promise<{ url: string; before: number; after: number } | null> {
   const match = DATA_URL_RE.exec(url);
   if (!match) return null;
   const mime = (match[1] ?? '').toLowerCase();
@@ -210,10 +234,15 @@ export async function normalizeMessageImages(
   const summary: ImageNormalizeSummary = { messages, normalized: 0, bytesBefore: 0, bytesAfter: 0 };
   if (!opts.enabled) return summary;
 
+  // No sharp (missing prebuild, unsupported platform): pass everything through
+  // untouched rather than failing the request.
+  const sharp = await loadSharp();
+  if (!sharp) return summary;
+
   for (const message of messages) {
     for (const slot of imageSlots(message)) {
       if (!slot.url.startsWith('data:')) continue;
-      const result = await normalizeDataUrl(slot.url, opts);
+      const result = await normalizeDataUrl(sharp, slot.url, opts);
       if (!result) continue;
       slot.set(result.url);
       summary.normalized += 1;

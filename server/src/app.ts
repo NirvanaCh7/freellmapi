@@ -176,7 +176,7 @@ export function createApp(config?: Config) {
   // images up to 8MB apiece) — so a single-screenshot Codex turn can clear
   // 10MB and used to 413 HERE, before auth/routing: no fallback attempt, no
   // analytics row, just an opaque 'request entity too large'. Those surfaces
-  // get the larger REQUEST_BODY_LIMIT_MB ceiling (default 50MB); everything
+  // get the larger REQUEST_BODY_LIMIT_MB ceiling (default 25MB); everything
   // else keeps the #200 limit — code agents (OpenCode, AionUI, Qwen Code)
   // ship very large system prompts + tool schemas + repo context, and 1mb cut
   // their sessions off mid-conversation. body-parser skips requests whose

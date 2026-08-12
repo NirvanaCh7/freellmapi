@@ -8,11 +8,16 @@ const DEFAULT_RPM = 120;
 // buffers the whole body in memory (2-3x transiently during the parse), so
 // this also bounds the per-request spike on small containers. Anything past
 // the ceiling 413s before routing — no fallback, no analytics row — so it
-// must sit above the largest payload we expect to serve; 50MB covers 2160p
-// screenshots duplicated across a replayed session. Raise
-// REQUEST_BODY_LIMIT_MB only if a client genuinely sends more. The
-// dashboard/admin surface keeps its own smaller fixed ceiling.
-const DEFAULT_REQUEST_BODY_LIMIT_MB = 50;
+// must sit above the largest payload we expect to serve. 25MB is the balance
+// point: it clears the observed 11.85MB replayed session with room to spare,
+// while keeping the worst case survivable on the small hosts this runs on (a
+// Pi or a 512MB VPS — the limit is PER REQUEST, so a handful of concurrent
+// maximal bodies is the number that actually has to fit in RAM). Inbound
+// image normalization shrinks payloads ~6-10x right after the parse, so the
+// steady state sits far below this. Raise REQUEST_BODY_LIMIT_MB on a bigger
+// box if a client genuinely sends more. The dashboard/admin surface keeps its
+// own smaller fixed ceiling.
+const DEFAULT_REQUEST_BODY_LIMIT_MB = 25;
 
 function parseRateLimitRpm(): number {
   const raw = process.env.PROXY_RATE_LIMIT_RPM;

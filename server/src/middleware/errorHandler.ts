@@ -24,7 +24,7 @@ export function errorHandler(err: Error, req: Request, res: Response, next: Next
     const received = (err as any).length ?? (err as any).expected;
     const message = `Request body too large${typeof received === 'number' ? ` (${received} bytes)` : ''}` +
       `${typeof limit === 'number' ? ` for the ${limit}-byte limit` : ''}. ` +
-      'Vision requests embed base64 images in the body; raise REQUEST_BODY_LIMIT_MB (default 50) to accept larger payloads.';
+      'Vision requests embed base64 images in the body; raise REQUEST_BODY_LIMIT_MB (default 25) to accept larger payloads.';
     if (INFERENCE_PATH_PREFIXES.some(prefix => req.path.startsWith(prefix))) {
       logRequest('proxy', 'payload-too-large', null, 'error', 0, 0, 0, message);
     }
